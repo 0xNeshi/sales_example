@@ -1,0 +1,6 @@
+[package]
+name = "sales_example"
+edition = "2024"
+
+[addresses]
+sales_example = "0x0"
