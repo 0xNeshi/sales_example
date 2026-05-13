@@ -1,32 +1,34 @@
-/// **KYC-gated scenario walkthrough + two misuse cases.**
+/// Scenario walkthroughs: KYC-gated strategic round.
 ///
-/// Happy path: a verified buyer mints an `AllowEntry<MY_TOKEN>` in the
-/// same PTB as their `purchase`, the sale finalizes successfully (soft
-/// cap met), and the buyer claims.
+/// Three tests:
 ///
-/// Misuse 1 (`unverified_buyer_cannot_mint_entry`): an unverified buyer
-/// cannot bypass the gate — `mint_entry` aborts before reaching the sale.
+///   1. `kyc_gated_purchase_and_claim` — happy path. Verified buyer
+///      mints an `AllowEntry<MY_TOKEN>` in the same PTB as `purchase`,
+///      the sale finalises successfully (soft cap met), buyer claims.
 ///
-/// Misuse 2 (`attacker_cannot_claim_buyers_receipt`): even if someone
-/// gets their hands on the buyer's receipt (e.g. via stolen private
-/// keys or contrived test scenarios), they still cannot claim because
-/// `claim` asserts `ctx.sender() == receipt.buyer`. Receipts are
-/// non-transferable at the type level (`key` only, no `store`), so the
-/// only realistic way for an attacker to reach a buyer's receipt is to
-/// also have the buyer's keys — at which point everything is already lost.
+///   2. `unverified_buyer_cannot_mint_entry` — misuse rejection. An
+///      unverified buyer cannot bypass compliance: `mint_entry` aborts
+///      before reaching the sale.
 ///
-/// `abort 0` sentinels are deliberate after known-aborting calls in
-/// expected_failure tests — they satisfy the type checker on locally
-/// bound values.
+///   3. `attacker_cannot_claim_buyers_receipt` — misuse rejection.
+///      Even if an attacker gets access to the buyer's receipt object
+///      (here through `take_from_address` shenanigans test_scenario
+///      allows; in real Sui this requires the buyer's signing key),
+///      `claim` aborts because `ctx.sender() != receipt.buyer`.
+///
+/// `abort 0` sentinels follow the known-aborting calls in the
+/// `expected_failure` tests so the type checker is satisfied on the
+/// locally bound values.
 #[test_only, allow(lint(abort_without_constant))]
 module sales_example::kyc_gated_tests;
 
-use sales_example::my_token::{Self, MY_TOKEN};
 use sales_example::prefunded_sale::{Self, PrefundedSale};
 use sales_example::refund_vault::RefundVault;
 use sales_example::sale::Receipt;
+use sales_example::my_token::{Self, MY_TOKEN};
 use sales_example::sale_factory;
 use sales_example::simple_kyc::{Self, KycModule, KycAdminCap};
+
 use sui::clock;
 use sui::coin::{Self, TreasuryCap};
 use sui::sui::SUI;
@@ -49,7 +51,7 @@ const PER_BUYER_CAP: u64 = 3_000;
 const INVENTORY: u64 = HARD_CAP * RATE;
 const PER_ENTRY_CAP: u64 = 3_000;
 
-// === Test: full KYC happy path ===
+// === Happy path ===
 
 #[test]
 fun kyc_gated_purchase_and_claim() {
@@ -68,19 +70,9 @@ fun kyc_gated_purchase_and_claim() {
         clock.set_for_testing(SETUP_AT);
 
         let (s_id, _v_id) = sale_factory::deploy_strategic_round(
-            &mut treasury_cap,
-            &mut kyc,
-            &kyc_cap,
-            TREASURY,
-            RATE,
-            INVENTORY,
-            HARD_CAP,
-            SOFT_CAP,
-            PER_BUYER_CAP,
-            OPENS_AT,
-            CLOSES_AT,
-            &clock,
-            scenario.ctx(),
+            &mut treasury_cap, &mut kyc, &kyc_cap, TREASURY,
+            RATE, INVENTORY, HARD_CAP, SOFT_CAP, PER_BUYER_CAP,
+            OPENS_AT, CLOSES_AT, &clock, scenario.ctx(),
         );
         sale_id = s_id;
 
@@ -91,7 +83,7 @@ fun kyc_gated_purchase_and_claim() {
     };
     scenario.next_tx(ISSUER);
 
-    // Verify VERIFIED_BUYER for this specific sale.
+    // Verify the buyer for this specific sale.
     {
         let mut kyc = scenario.take_shared<KycModule>();
         let kyc_cap = scenario.take_from_sender<KycAdminCap>();
@@ -101,7 +93,7 @@ fun kyc_gated_purchase_and_claim() {
     };
     scenario.next_tx(VERIFIED_BUYER);
 
-    // Buyer mints entry + purchases in the same PTB.
+    // mint_entry + purchase in the same PTB.
     {
         let kyc = scenario.take_shared<KycModule>();
         let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
@@ -111,11 +103,7 @@ fun kyc_gated_purchase_and_claim() {
         let entry = simple_kyc::mint_entry(&kyc, sale_id, scenario.ctx());
         let payment = coin::mint_for_testing<SUI>(2_500, scenario.ctx());
         prefunded_sale::purchase<MY_TOKEN, SUI>(
-            &mut sale,
-            payment,
-            option::some(entry),
-            &clock,
-            scenario.ctx(),
+            &mut sale, payment, option::some(entry), &clock, scenario.ctx(),
         );
 
         clock.destroy_for_testing();
@@ -124,7 +112,7 @@ fun kyc_gated_purchase_and_claim() {
     };
     scenario.next_tx(ISSUER);
 
-    // Permissionless finalize (passes the vault, which transitions to Closed).
+    // Permissionless finalize after close. Vault transitions to Closed.
     {
         let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
         let mut vault = scenario.take_shared<RefundVault<SUI>>();
@@ -155,7 +143,7 @@ fun kyc_gated_purchase_and_claim() {
     test_scenario::end(scenario);
 }
 
-// === Misuse 1: unverified buyer rejected at compliance layer ===
+// === Misuse 1: unverified buyer ===
 
 #[test, expected_failure(abort_code = simple_kyc::ENotVerified)]
 fun unverified_buyer_cannot_mint_entry() {
@@ -174,19 +162,9 @@ fun unverified_buyer_cannot_mint_entry() {
         clock.set_for_testing(SETUP_AT);
 
         let (s_id, _v_id) = sale_factory::deploy_strategic_round(
-            &mut treasury_cap,
-            &mut kyc,
-            &kyc_cap,
-            TREASURY,
-            RATE,
-            INVENTORY,
-            HARD_CAP,
-            SOFT_CAP,
-            PER_BUYER_CAP,
-            OPENS_AT,
-            CLOSES_AT,
-            &clock,
-            scenario.ctx(),
+            &mut treasury_cap, &mut kyc, &kyc_cap, TREASURY,
+            RATE, INVENTORY, HARD_CAP, SOFT_CAP, PER_BUYER_CAP,
+            OPENS_AT, CLOSES_AT, &clock, scenario.ctx(),
         );
         sale_id = s_id;
 
@@ -199,13 +177,13 @@ fun unverified_buyer_cannot_mint_entry() {
 
     {
         let kyc = scenario.take_shared<KycModule>();
-        // Aborts: this buyer is not in the verified table.
+        // Aborts: UNVERIFIED_BUYER is not in the verified table.
         let _entry = simple_kyc::mint_entry(&kyc, sale_id, scenario.ctx());
         abort 0
     }
 }
 
-// === Misuse 2: only the buyer can claim their receipt ===
+// === Misuse 2: receipt cannot be claimed by a non-buyer ===
 
 #[test, expected_failure(abort_code = prefunded_sale::EBuyerOnly)]
 fun attacker_cannot_claim_buyers_receipt() {
@@ -224,19 +202,9 @@ fun attacker_cannot_claim_buyers_receipt() {
         clock.set_for_testing(SETUP_AT);
 
         let (s_id, _v_id) = sale_factory::deploy_strategic_round(
-            &mut treasury_cap,
-            &mut kyc,
-            &kyc_cap,
-            TREASURY,
-            RATE,
-            INVENTORY,
-            HARD_CAP,
-            SOFT_CAP,
-            PER_BUYER_CAP,
-            OPENS_AT,
-            CLOSES_AT,
-            &clock,
-            scenario.ctx(),
+            &mut treasury_cap, &mut kyc, &kyc_cap, TREASURY,
+            RATE, INVENTORY, HARD_CAP, SOFT_CAP, PER_BUYER_CAP,
+            OPENS_AT, CLOSES_AT, &clock, scenario.ctx(),
         );
         sale_id = s_id;
 
@@ -247,7 +215,6 @@ fun attacker_cannot_claim_buyers_receipt() {
     };
     scenario.next_tx(ISSUER);
 
-    // Verify VERIFIED_BUYER (not ATTACKER).
     {
         let mut kyc = scenario.take_shared<KycModule>();
         let kyc_cap = scenario.take_from_sender<KycAdminCap>();
@@ -257,7 +224,7 @@ fun attacker_cannot_claim_buyers_receipt() {
     };
     scenario.next_tx(VERIFIED_BUYER);
 
-    // VERIFIED_BUYER purchases. Receipt is delivered to their address.
+    // VERIFIED_BUYER purchases.
     {
         let kyc = scenario.take_shared<KycModule>();
         let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
@@ -267,11 +234,7 @@ fun attacker_cannot_claim_buyers_receipt() {
         let entry = simple_kyc::mint_entry(&kyc, sale_id, scenario.ctx());
         let payment = coin::mint_for_testing<SUI>(2_500, scenario.ctx());
         prefunded_sale::purchase<MY_TOKEN, SUI>(
-            &mut sale,
-            payment,
-            option::some(entry),
-            &clock,
-            scenario.ctx(),
+            &mut sale, payment, option::some(entry), &clock, scenario.ctx(),
         );
 
         clock.destroy_for_testing();
@@ -280,7 +243,6 @@ fun attacker_cannot_claim_buyers_receipt() {
     };
     scenario.next_tx(ISSUER);
 
-    // Finalize so claim becomes available.
     {
         let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
         let mut vault = scenario.take_shared<RefundVault<SUI>>();
@@ -293,9 +255,8 @@ fun attacker_cannot_claim_buyers_receipt() {
     };
     scenario.next_tx(ATTACKER);
 
-    // ATTACKER reaches into VERIFIED_BUYER's inventory (test-scenario
-    // shenanigans — real Sui would require the buyer's signing key) and
-    // tries to claim. Aborts: sender (ATTACKER) != receipt.buyer (VERIFIED_BUYER).
+    // ATTACKER reaches into VERIFIED_BUYER's inventory and tries to claim.
+    // Aborts: ctx.sender() (ATTACKER) != receipt.buyer (VERIFIED_BUYER).
     {
         let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
         let receipt = scenario.take_from_address<Receipt<MY_TOKEN>>(VERIFIED_BUYER);

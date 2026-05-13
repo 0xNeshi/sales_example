@@ -1,84 +1,102 @@
-/// Shared types used across the `openzeppelin_sales` family of sale flavors.
+/// Shared types used across the sales library's family of sale flavors.
 ///
-/// This module owns:
-///   - `Phase` — the lifecycle enum every sale flavor shares.
-///   - `Receipt<S>` — the per-buyer claim ticket.
+/// Includes the lifecycle enum, the per-buyer claim ticket, and the
+/// optional `VestingSchedule` policy that a sale flavor may attach
+/// to make distribution gradual. The schedule is issuer-defined and
+/// fixed at sale construction — buyers never supply or override it.
 ///
-/// ### Why `Receipt<S>` has `key` only (no `store`)
+/// This module owns the lifecycle enum and the per-buyer claim ticket
+/// that every sale flavor reuses. Sale flavors (the v1 `prefunded_sale`,
+/// the future `minting_sale`) compose these types; integrator code only
+/// observes them through the flavor module's public API.
 ///
-/// Receipts are **non-transferable by design**. With only the `key` ability:
-///   - `transfer::public_transfer` rejects them (requires `key + store`).
-///   - `transfer::transfer` is restricted to this module.
-///   - They cannot be wrapped as a field inside another struct
-///     (fields require `store`).
+/// ### `Receipt<S>` is non-transferable
 ///
-/// The only way a receipt moves between addresses is via the library's
-/// own `deliver_receipt`, which runs at purchase time and sends the
-/// receipt to the recorded buyer. After that, the receipt stays with
-/// that buyer until they consume it via `claim` or `refund`.
+/// `Receipt<S>` has the `key` ability only — no `store`. This has three
+/// concrete consequences:
 ///
-/// This eliminates two footguns we discovered during review:
-///   1. **KYC bypass at distribution.** A verified buyer transferring
-///      their receipt to an unverified address that then claims.
-///   2. **Stranded allocations.** A buyer transferring their receipt to
-///      an address that can't claim (or won't), permanently pinning
-///      inventory.
+/// - `transfer::public_transfer` rejects a receipt (it requires `store`).
+/// - `transfer::transfer` is restricted to this module, so no other
+///   module can move a receipt across addresses.
+/// - A receipt cannot appear as a struct field elsewhere (fields require
+///   `store`).
 ///
-/// Partners who genuinely need a transferable secondary market for
-/// allocations cannot wrap this `Receipt<S>` directly (no `store`).
-/// They would need to either (a) consume the receipt via `claim`/`refund`
-/// and trade the resulting `Coin<S>` / `Coin<P>` instead, or (b) build
-/// their own ticket type with appropriate abilities and compliance hooks.
+/// The single transfer path is `deliver_receipt`, called by sale flavors
+/// at purchase time to send the receipt to the buyer. After that, the
+/// receipt stays with the buyer until consumed by `claim` or `refund`.
+/// `claim` and `refund` additionally assert `ctx.sender() == buyer`,
+/// so even shared custody arrangements cannot delegate redemption.
 ///
-/// ### Tier-1 / Tier-2 boundary (teaching example caveat)
+/// Two consequences integrators should be aware of:
 ///
-/// The `new_receipt`, `deliver_receipt`, and `consume_receipt` helpers
-/// below are `public(package)`. In a real deployment where this library
-/// lives in its own Move package, integrator code cannot reach them. In
-/// **this** single-package example, the `sources/integration/` modules
-/// technically *could* call them — but doing so would defeat the
-/// audit-boundary story. They don't, and they shouldn't. The Tier-2
-/// modules in this example only consume the public API surface.
+/// - **KYC/compliance enforced at purchase carries through to
+///   distribution.** A verified buyer cannot forward their claim to an
+///   unverified address.
+/// - **No wallet rotation between purchase and claim.** The address that
+///   purchased is the address that must claim or refund. Hold the
+///   purchasing key safely.
+///
+/// Partners that want a transferable allocation market must either
+/// trade the resulting `Coin<S>` after `claim` (or `Coin<P>` after
+/// `refund`), or build their own ticket type with abilities and
+/// compliance checks of their choosing.
 module sales_example::sale;
+
+use sui::coin::Coin;
 
 // === Phase ===
 
 /// Lifecycle phases shared by every sale flavor.
 ///
 /// Transitions:
-///   Init      → Active                     (admin calls `share_and_activate`)
-///   Active    → Finalized | Cancelled      (terminal)
+///   - `Init      → Active`                  via the flavor's `share_and_activate`
+///   - `Active    → Finalized`               via the flavor's `finalize`
+///   - `Active    → Cancelled`               via the flavor's `cancel_*`
+///
+/// `Finalized` and `Cancelled` are terminal.
 public enum Phase has copy, drop, store {
-    /// Sale is created but not yet shared. Admin deposits inventory and
-    /// wires hooks here. Holding the sale by `&mut` is the authority.
+    /// Sale exists but is not yet shared. Setup functions (deposit
+    /// inventory, configure caps, pair vault, enable allowlist) run
+    /// in this phase. Authority is implicit: holding the sale value
+    /// by `&mut`.
     Init,
-    /// Sale is shared and accepting purchases (subject to `[opens_at, closes_at]`).
+    /// Sale is shared. Purchases are accepted within
+    /// `[opens_at_ms, closes_at_ms]`.
     Active,
-    /// Successful close: claims enabled, proceeds withdrawable.
+    /// Successful close. Buyers can `claim`. Admin can withdraw
+    /// proceeds and any unallocated inventory.
     Finalized,
-    /// Failed close: refunds enabled via the paired vault.
+    /// Failed close. Buyers can `refund` from the paired vault.
+    /// Admin can withdraw unallocated inventory.
     Cancelled,
 }
 
 // === Receipt ===
 
-/// Per-buyer claim ticket. One receipt per purchase. Buyer-owned.
-/// **`key` only** — non-transferable (see module doc).
+/// Per-buyer claim ticket. One receipt per purchase. Non-transferable
+/// (see module doc).
+///
+/// Fields:
+/// - `sale_id`: identifies the issuing sale. Verified on every
+///   redemption path.
+/// - `buyer`: address that purchased. `claim` and `refund` assert
+///   `ctx.sender() == buyer`.
+/// - `paid`: payment amount in `P`'s smallest units. Refunds pay back
+///   exactly this amount.
+/// - `allocation`: sale token amount in `S`'s smallest units. `claim`
+///   returns exactly this amount as `Coin<S>`.
+/// - `purchased_at_ms`: timestamp at purchase time. Available to
+///   integrators that need time-anchored post-finalize logic.
 public struct Receipt<phantom S> has key {
     id: UID,
-    /// Sale this receipt was issued by. Verified at claim/refund.
     sale_id: ID,
-    /// Buyer of record. Claim and refund require `ctx.sender() == buyer`.
     buyer: address,
-    /// Payment amount (in P smallest units).
     paid: u64,
-    /// Sale token allocation (in S smallest units).
     allocation: u64,
-    /// Time of purchase (Sui Clock ms).
     purchased_at_ms: u64,
 }
 
-// === Public read-only accessors ===
+// === Receipt views ===
 
 public fun receipt_sale_id<S>(r: &Receipt<S>): ID { r.sale_id }
 
@@ -120,15 +138,15 @@ public fun is_cancelled(p: &Phase): bool {
     }
 }
 
-// === Package-internal constructors and helpers ===
+// === Package-internal helpers ===
 //
-// These functions are **library-internal**. In a multi-package
-// deployment of the audit-boundary library, `public(package)` would
-// restrict them to other library modules. In this single-package
-// teaching example they are technically reachable by the
-// `sources/integration/` modules; integrator code should not call them.
+// Receipt construction, delivery, and consumption are package-internal.
+// Sale flavors (`prefunded_sale`, future `minting_sale`) and the
+// vested-claim path (`prefunded_sale::claim_into_vesting` →
+// `vested_claim`) call into these helpers; no other code path can
+// produce or destroy a `Receipt<S>`.
 
-/// Mint a fresh receipt. Only the sale flavors call this.
+/// Mint a fresh receipt. Sale flavors call this from `purchase`.
 public(package) fun new_receipt<S>(
     sale_id: ID,
     buyer: address,
@@ -147,24 +165,130 @@ public(package) fun new_receipt<S>(
     }
 }
 
-/// Transfer a freshly-minted receipt to its buyer. Only callable from
-/// the sales package — this is the **single** transfer path for receipts.
-/// External code has no other way to move a receipt across addresses,
-/// which is what makes receipts effectively non-transferable.
+/// Deliver a freshly-minted receipt to its buyer. The only transfer
+/// path for receipts. Sale flavors call this immediately after
+/// `new_receipt` and never expose the receipt back to the caller.
 public(package) fun deliver_receipt<S>(receipt: Receipt<S>, to: address) {
     transfer::transfer(receipt, to);
 }
 
-/// Destructively read receipt fields, returning them.
-/// Used by `prefunded_sale::claim`, `prefunded_sale::refund`,
-/// and `claim_vested` adapters. The receipt's UID is deleted.
+/// Destructively read a receipt. Used by `claim`, `claim_into_vesting`,
+/// and `refund` paths in sale flavors. Deletes the receipt's UID.
+///
+/// Returns `(sale_id, buyer, paid, allocation, purchased_at_ms)`.
 public(package) fun consume_receipt<S>(r: Receipt<S>): (ID, address, u64, u64, u64) {
     let Receipt { id, sale_id, buyer, paid, allocation, purchased_at_ms } = r;
     object::delete(id);
     (sale_id, buyer, paid, allocation, purchased_at_ms)
 }
 
-// === Phase factories (internal) ===
+// === VestingSchedule ===
+//
+// Issuer-defined vesting policy. Constructed during sale Init via the
+// flavor's setter (e.g. `prefunded_sale::set_vesting_schedule`) and
+// read by adapters at claim time. Buyers cannot influence these
+// values; the schedule travels with the sale, not the receipt.
+
+/// All times in milliseconds. The schedule is interpreted exactly the
+/// way the vesting wallet interprets it: linear from `start_ms` to
+/// `start_ms + duration_ms`, with a cliff gate (not curve shift) at
+/// `start_ms + cliff_duration_ms`.
+public struct VestingSchedule has copy, drop, store {
+    start_ms: u64,
+    cliff_duration_ms: u64,
+    duration_ms: u64,
+}
+
+#[error(code = 100)]
+const EVestingDurationZero: vector<u8> = "Vesting duration_ms must be greater than zero";
+#[error(code = 101)]
+const EVestingInvalidCliff: vector<u8> = "Vesting cliff_duration_ms must be <= duration_ms";
+#[error(code = 102)]
+const EVestingScheduleOverflow: vector<u8> = "start_ms + duration_ms overflows u64";
+
+const U64_MAX: u128 = 18446744073709551615;
+
+/// Construct a vesting schedule. Asserts:
+/// - `duration_ms > 0`,
+/// - `cliff_duration_ms <= duration_ms`,
+/// - `start_ms + duration_ms` fits in `u64` (so downstream addition
+///   arithmetic in vesting wallets cannot overflow).
+public fun new_vesting_schedule(
+    start_ms: u64,
+    cliff_duration_ms: u64,
+    duration_ms: u64,
+): VestingSchedule {
+    assert!(duration_ms > 0, EVestingDurationZero);
+    assert!(cliff_duration_ms <= duration_ms, EVestingInvalidCliff);
+    let end_u128 = (start_ms as u128) + (duration_ms as u128);
+    assert!(end_u128 <= U64_MAX, EVestingScheduleOverflow);
+    VestingSchedule { start_ms, cliff_duration_ms, duration_ms }
+}
+
+public fun vesting_start_ms(s: &VestingSchedule): u64 { s.start_ms }
+
+public fun vesting_cliff_duration_ms(s: &VestingSchedule): u64 { s.cliff_duration_ms }
+
+public fun vesting_duration_ms(s: &VestingSchedule): u64 { s.duration_ms }
+
+// === VestedAllocation ===
+//
+// Hot-potato that wraps a single buyer's claim on a vesting-attached
+// sale. Returned from `prefunded_sale::claim_into_vesting`; consumed
+// by a library-side router (e.g. `vested_claim::into_shared_wallet`)
+// which is the only path that can extract the inner `Coin<S>`.
+//
+// Why a hot-potato:
+//   - No `drop`: the caller cannot silently discard it.
+//   - No `key` / `store`: it cannot be transferred, wrapped, or stashed
+//     in a dynamic field.
+//   - Fields are private to this module, so unpacking requires
+//     `unpack_vested_allocation`, which is `public(package)` and
+//     reachable only from sibling library modules.
+//
+// Net effect: once a vesting schedule is attached to a sale, the only
+// way to dispose of a claim is to route it through a library-defined
+// consumer that honors the schedule. Buyers cannot reach the raw coin.
+
+/// Library-internal carrier for a vested claim. See module note above.
+///
+/// The hot-potato carries `Coin<S>` rather than `Balance<S>` because
+/// the only consumer path (`vested_claim::into_*`) immediately feeds
+/// the inner value into `vesting_wallet::deposit`, which already takes
+/// a `Coin<S>` — keeping the carrier shape aligned avoids a needless
+/// `Balance ↔ Coin` round-trip in the same transaction.
+#[allow(lint(coin_field))]
+public struct VestedAllocation<phantom S> {
+    coin: Coin<S>,
+    schedule: VestingSchedule,
+    beneficiary: address,
+    sale_id: ID,
+}
+
+/// Build a `VestedAllocation`. Library-internal: only sibling library
+/// modules (e.g. `prefunded_sale::claim_into_vesting`) construct these.
+public(package) fun new_vested_allocation<S>(
+    coin: Coin<S>,
+    schedule: VestingSchedule,
+    beneficiary: address,
+    sale_id: ID,
+): VestedAllocation<S> {
+    VestedAllocation<S> { coin, schedule, beneficiary, sale_id }
+}
+
+/// Destructure a `VestedAllocation`. Library-internal: only sibling
+/// library modules (e.g. `vested_claim`) unpack these into the
+/// downstream wallet shape.
+///
+/// Returns `(coin, schedule, beneficiary, sale_id)`.
+public(package) fun unpack_vested_allocation<S>(
+    allocation: VestedAllocation<S>,
+): (Coin<S>, VestingSchedule, address, ID) {
+    let VestedAllocation { coin, schedule, beneficiary, sale_id } = allocation;
+    (coin, schedule, beneficiary, sale_id)
+}
+
+// === Phase factories ===
 
 public(package) fun phase_init(): Phase { Phase::Init }
 

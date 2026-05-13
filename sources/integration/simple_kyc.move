@@ -1,72 +1,73 @@
-/// Example compliance module — the kind of code an integrator owns.
+/// Example compliance module — integrator-owned.
 ///
-/// `openzeppelin_sales::allowlist` ships a typed slot (`AllowlistAdmin<S>`,
-/// `AllowEntry<S>`); it does **not** ship verification logic. Each consumer
-/// wires their own. This module shows one realistic pattern: an admin-
-/// managed verified-buyer table with **per-sale, per-entry caps set by
-/// the compliance officer**, supporting multiple concurrent sales of the
-/// same token.
+/// `sales_example::allowlist` ships a typed slot
+/// (`AllowlistAdmin<S>`, `AllowEntry<S>`) but no verification logic.
+/// This module is one realistic shape an integrator can use to wire
+/// the slot to their compliance scheme. The library does not depend
+/// on this module; replacing it with a merkle-proof verifier, an
+/// on-chain tier staker, an off-chain accredited-investor oracle,
+/// etc. requires no library change.
 ///
-/// ### Per-entry vs cumulative — read this carefully
+/// Tables this module owns:
 ///
-/// The value stored in `verified` is the **`max_per_entry`** cap — the
-/// maximum payment per `AllowEntry<MY_TOKEN>`. It is **not** a cumulative
-/// per-buyer allocation cap. A verified buyer can call `mint_entry` any
-/// number of times in any number of PTBs, each time getting a fresh
-/// entry up to `max_per_entry`, and each entry feeds a separate
-/// `purchase` call.
+/// - `verified: Table<KycKey, u64>` — composite key `(buyer, sale_id)`
+///   maps to the buyer's per-entry payment cap for that sale. The
+///   compliance officer sets the cap; the buyer cannot.
+/// - `admins: Table<ID, AllowlistAdmin<MY_TOKEN>>` — one
+///   `AllowlistAdmin<MY_TOKEN>` per registered sale. A single KYC
+///   module can serve multiple concurrent sales of the same token
+///   (private → strategic → public) and reuse one verified list.
 ///
-/// If you want a **cumulative per-buyer cap** across all of a buyer's
-/// purchases, configure it at the **sale** level via
-/// `prefunded_sale::set_per_buyer_cap`. That cap is enforced inside
-/// `purchase` against the running `contributions[buyer]` total — the
-/// KYC module cannot enforce it on its own because it does not see
-/// purchase outcomes.
+/// ### `max_per_entry` vs cumulative
 ///
-/// The two caps compose like this on every purchase:
-///   - the entry's `max_per_entry` bounds *this single* payment;
-///   - the sale's `per_buyer_cap` bounds the *sum* of all the buyer's
-///     payments to this sale.
+/// The `u64` stored in `verified` is **per-entry**, not cumulative:
+/// it bounds the payment of a single `AllowEntry<MY_TOKEN>`. A
+/// verified buyer can call `mint_entry` repeatedly and submit
+/// multiple `purchase` calls, each up to `max_per_entry`.
 ///
-/// `sale_factory::deploy_strategic_round` sets both. If you copy this
-/// module standalone, remember the sale-level cap is your responsibility.
+/// **The cumulative bound lives on the sale**, not here. Configure
+/// `prefunded_sale::set_per_buyer_cap` if a single buyer must not
+/// purchase more than some total across all their purchases. The two
+/// caps compose:
+/// - per-entry bounds *this single* payment;
+/// - per-buyer bounds the *sum* of the buyer's payments to the sale.
 ///
-/// Key shapes:
-///   - `verified: Table<KycKey, u64>` — composite key `(buyer, sale_id)`
-///     maps to `max_per_entry`. A single buyer can be verified for
-///     several sales independently, each with its own per-entry cap.
-///   - `admins: Table<ID, AllowlistAdmin<MY_TOKEN>>` — one entry per
-///     registered sale.
+/// `sale_factory::deploy_strategic_round` sets both. If this module
+/// is copied without `set_per_buyer_cap` configured on the sale, one
+/// verified buyer can buy the entire allocation up to `hard_cap`.
 ///
 /// ### Bootstrap order
 ///
-/// 1. Publish the package and the sales library together.
-/// 2. `simple_kyc::deploy` — creates the shared `KycModule` and yields
-///    `KycAdminCap` to the compliance officer.
-/// 3. For each sale to KYC-gate:
-///    - `prefunded_sale::create_sale` then `enable_allowlist` →
-///      `AllowlistAdmin<MY_TOKEN>`.
-///    - `simple_kyc::register_admin(kyc, kyc_cap, allow_admin)`.
-/// 4. The compliance officer verifies buyers per sale via
+/// 1. `simple_kyc::deploy` — share the `KycModule`, owner receives
+///    `KycAdminCap`.
+/// 2. For each sale to gate:
+///    - Create the sale and call `enable_allowlist`.
+///    - `register_admin` routes the returned `AllowlistAdmin<MY_TOKEN>`
+///      into this module, keyed by `sale_id`.
+/// 3. The compliance officer verifies buyers per sale via
 ///    `verify_buyer(kyc, cap, buyer, sale_id, max_per_entry)`.
-/// 5. Verified buyers call `mint_entry(kyc, sale_id)` and `purchase`
-///    in the **same PTB**.
+///    `verify_buyer` requires the sale to be registered first, so
+///    typos in `sale_id` fail fast rather than producing dead
+///    records.
+/// 4. Verified buyers call `mint_entry(kyc, sale_id)` and
+///    `purchase` in the same PTB.
 ///
 /// ### Recovery
 ///
-/// `KycModule` is a **shared** object — it cannot be transferred. The
-/// unit of recovery is `KycAdminCap`: owned and transferable, so a
-/// compromised compliance officer can be replaced by transferring the
-/// cap to a new operator (via multisig PTB, etc.). The shared module
-/// keeps all state intact.
+/// `KycModule` is shared and cannot be transferred. The unit of
+/// recovery is `KycAdminCap`: owned and transferable. A compromised
+/// compliance officer can be replaced by transferring the cap to a
+/// new operator address (via a multisig PTB, for instance). The
+/// shared module retains all state.
 ///
-/// **Footgun:** if `KycAdminCap` is lost outright, no new buyers can
-/// be verified and no new sales can be registered. Existing entries
-/// continue to work. Wrap the cap in an access-controlled holder.
+/// If `KycAdminCap` itself is lost, no new buyers can be verified
+/// and no new sales can be registered. Existing entries continue to
+/// work. Hold the cap in an access-controlled wrapper.
 module sales_example::simple_kyc;
 
 use sales_example::allowlist::{Self, AllowEntry, AllowlistAdmin};
 use sales_example::my_token::MY_TOKEN;
+
 use sui::event;
 use sui::table::{Self, Table};
 
@@ -85,8 +86,8 @@ const ESaleNotRegistered: vector<u8> = "No allowlist admin registered for this s
 
 // === Types ===
 
-/// Composite key for the verified table. A buyer is verified
-/// *per-sale*, with a per-sale per-entry cap.
+/// Composite key for the verified table: a buyer is verified
+/// per-sale, with a per-sale per-entry cap.
 public struct KycKey has copy, drop, store {
     buyer: address,
     sale_id: ID,
@@ -95,14 +96,16 @@ public struct KycKey has copy, drop, store {
 /// Compliance module. Shared.
 public struct KycModule has key {
     id: UID,
-    /// (buyer, sale_id) → max_per_entry (0 = no per-entry cap; the
-    /// sale's own per-buyer cap, if any, still applies).
+    /// `(buyer, sale_id) → max_per_entry`. `0` means "no per-entry
+    /// cap" (the sale's own per-buyer cap, if configured, still
+    /// applies).
     verified: Table<KycKey, u64>,
-    /// sale_id → admin. One per registered sale.
+    /// `sale_id → admin`. One per registered sale.
     admins: Table<ID, AllowlistAdmin<MY_TOKEN>>,
 }
 
-/// Authority over this KYC module. Owned, transferable.
+/// Authority over this KYC module. Owned, transferable. Compromised-
+/// officer recovery is "transfer the cap to a new address."
 public struct KycAdminCap has key, store {
     id: UID,
     kyc_id: ID,
@@ -142,6 +145,9 @@ public struct BuyerRevoked has copy, drop {
 
 // === Deploy ===
 
+/// Create + share the `KycModule`. Transfers `KycAdminCap` to the
+/// caller. Returns the IDs the caller's tooling needs to track both
+/// objects across transactions.
 #[allow(lint(self_transfer))]
 public fun deploy(ctx: &mut TxContext): (ID, ID) {
     let kyc = KycModule {
@@ -162,8 +168,15 @@ public fun deploy(ctx: &mut TxContext): (ID, ID) {
 
 // === Admin operations ===
 
-/// Register an `AllowlistAdmin<MY_TOKEN>` for a specific sale.
-public fun register_admin(kyc: &mut KycModule, cap: &KycAdminCap, admin: AllowlistAdmin<MY_TOKEN>) {
+/// Register an `AllowlistAdmin<MY_TOKEN>` issued by a sale's
+/// `enable_allowlist`. The `sale_id` is read directly from the admin
+/// so the caller cannot misroute it. Aborts if a different admin is
+/// already registered for the same sale.
+public fun register_admin(
+    kyc: &mut KycModule,
+    cap: &KycAdminCap,
+    admin: AllowlistAdmin<MY_TOKEN>,
+) {
     assert_cap(kyc, cap);
     let sale_id = allowlist::admin_sale_id(&admin);
     assert!(!table::contains(&kyc.admins, sale_id), ESaleAlreadyRegistered);
@@ -171,24 +184,15 @@ public fun register_admin(kyc: &mut KycModule, cap: &KycAdminCap, admin: Allowli
     event::emit(SaleRegistered { kyc_id: object::id(kyc), sale_id });
 }
 
-/// Verify a buyer for a specific sale at a specific **per-entry** cap.
+/// Verify a buyer for a specific sale, at a specific per-entry cap.
 ///
-/// `max_per_entry` is the upper bound on the payment of one
-/// `AllowEntry<MY_TOKEN>` minted for this buyer-and-sale. It is **not**
-/// a cumulative per-buyer cap — a verified buyer can mint multiple
-/// entries (one per `mint_entry` call) and purchase repeatedly. For
-/// a cumulative cap, configure `prefunded_sale::set_per_buyer_cap`
-/// at the sale level. See the module-level docs for the composition.
+/// **Per-entry, not cumulative.** See module docs.
 ///
-/// `max_per_entry = 0` means "no per-entry cap" (the sale's own
-/// per-buyer cap, if configured, still applies).
+/// `max_per_entry = 0` disables the per-entry cap (the sale's own
+/// `per_buyer_cap`, if configured, still applies).
 ///
-/// **Requires the sale to be registered first** (via `register_admin`).
-/// This prevents operators from creating dead verification records for
-/// sale IDs that don't exist — `mint_entry` would later reject them
-/// anyway, but failing fast at verification surfaces the mistake
-/// immediately. Recommended bootstrap order: `register_admin` then
-/// `verify_buyer`.
+/// Aborts if the sale is not yet registered. Recommended order:
+/// `register_admin` first, then `verify_buyer`.
 public fun verify_buyer(
     kyc: &mut KycModule,
     cap: &KycAdminCap,
@@ -209,7 +213,7 @@ public fun verify_buyer(
     });
 }
 
-/// Update an already-verified buyer's per-entry cap *for one sale*.
+/// Update an already-verified buyer's per-entry cap for one sale.
 /// Other sales the buyer is verified for are unaffected.
 public fun set_buyer_cap(
     kyc: &mut KycModule,
@@ -232,7 +236,12 @@ public fun set_buyer_cap(
 }
 
 /// Remove a buyer's verification for a specific sale.
-public fun revoke_buyer(kyc: &mut KycModule, cap: &KycAdminCap, buyer: address, sale_id: ID) {
+public fun revoke_buyer(
+    kyc: &mut KycModule,
+    cap: &KycAdminCap,
+    buyer: address,
+    sale_id: ID,
+) {
     assert_cap(kyc, cap);
     let key = KycKey { buyer, sale_id };
     assert!(table::contains(&kyc.verified, key), ENotVerified);
@@ -242,13 +251,20 @@ public fun revoke_buyer(kyc: &mut KycModule, cap: &KycAdminCap, buyer: address, 
 
 // === Buyer-facing: mint an entry ===
 
-/// Verified buyers call this to mint a fresh `AllowEntry<MY_TOKEN>` they
-/// can immediately consume in a `prefunded_sale::purchase` call in the
-/// **same PTB**.
+/// Mint an `AllowEntry<MY_TOKEN>` for `ctx.sender()` against the
+/// registered sale at `sale_id`. The entry's `max_amount` is read
+/// from the `verified` table — buyers cannot choose their own cap.
 ///
-/// Looks up the per-entry cap via `(sender, sale_id)` — buyers cannot
-/// choose their own cap.
-public fun mint_entry(kyc: &KycModule, sale_id: ID, ctx: &TxContext): AllowEntry<MY_TOKEN> {
+/// Aborts if the sender is not verified for this sale, or if the
+/// sale is not registered.
+///
+/// The entry has no abilities; it must be consumed by
+/// `prefunded_sale::purchase` in the same PTB.
+public fun mint_entry(
+    kyc: &KycModule,
+    sale_id: ID,
+    ctx: &TxContext,
+): AllowEntry<MY_TOKEN> {
     let buyer = ctx.sender();
     let key = KycKey { buyer, sale_id };
     assert!(table::contains(&kyc.verified, key), ENotVerified);

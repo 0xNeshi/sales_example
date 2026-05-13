@@ -1,24 +1,26 @@
-/// **Failure-path scenario walkthrough.** Soft-cap miss with refund vault.
+/// Scenario walkthrough: soft-cap miss with refund vault.
 ///
-/// Story:
-///   1. Issuer publishes MY_TOKEN and the KYC module.
-///   2. Issuer deploys a strategic round (KYC + soft cap + vault + per-buyer cap).
-///   3. Issuer verifies BUYER_1 for *this specific sale* at a per-entry cap.
-///   4. BUYER_1 purchases a small amount (well under soft cap).
-///   5. Window closes without reaching soft cap; **anyone** calls
-///      `cancel_after_close` — proceeds drain into the vault, vault flips
-///      to Refunding.
-///   6. BUYER_1 refunds, gets back exactly what they paid.
-///   7. Treasury reclaims unsold inventory.
+/// The flow exercised:
+///   - Issuer publishes MY_TOKEN and the KYC module.
+///   - Issuer deploys a strategic round (KYC + soft cap + vault +
+///     per-buyer cap).
+///   - Issuer verifies BUYER_1 for this specific sale at a per-entry cap.
+///   - BUYER_1 purchases a small amount (well under soft cap).
+///   - The window closes without reaching soft cap; a non-admin third
+///     party calls the permissionless `cancel_after_close`. Proceeds
+///     drain into the vault, vault flips to `Refunding`.
+///   - BUYER_1 refunds, getting back exactly what they paid.
+///   - Treasury reclaims unsold inventory.
 #[test_only]
 module sales_example::refund_path_tests;
 
-use sales_example::my_token::{Self, MY_TOKEN};
 use sales_example::prefunded_sale::{Self, PrefundedSale, SaleAdminCap};
 use sales_example::refund_vault::{Self, RefundVault};
 use sales_example::sale::Receipt;
+use sales_example::my_token::{Self, MY_TOKEN};
 use sales_example::sale_factory;
 use sales_example::simple_kyc::{Self, KycModule, KycAdminCap};
+
 use sui::clock;
 use sui::coin::{Self, TreasuryCap};
 use sui::sui::SUI;
@@ -44,12 +46,10 @@ const PER_ENTRY_CAP: u64 = 1_000;
 fun strategic_round_soft_cap_miss_refund() {
     let mut scenario = test_scenario::begin(ISSUER);
 
-    // --- Tx 1: Init token + KYC module ---
     my_token::init_for_testing(scenario.ctx());
     let (_, _) = simple_kyc::deploy(scenario.ctx());
     scenario.next_tx(ISSUER);
 
-    // --- Tx 2: Deploy the strategic round ---
     let sale_id;
     {
         let mut treasury_cap = scenario.take_from_sender<TreasuryCap<MY_TOKEN>>();
@@ -59,19 +59,9 @@ fun strategic_round_soft_cap_miss_refund() {
         clock.set_for_testing(SETUP_AT);
 
         let (s_id, _v_id) = sale_factory::deploy_strategic_round(
-            &mut treasury_cap,
-            &mut kyc,
-            &kyc_cap,
-            TREASURY,
-            RATE,
-            INVENTORY,
-            HARD_CAP,
-            SOFT_CAP,
-            PER_BUYER_CAP,
-            OPENS_AT,
-            CLOSES_AT,
-            &clock,
-            scenario.ctx(),
+            &mut treasury_cap, &mut kyc, &kyc_cap, TREASURY,
+            RATE, INVENTORY, HARD_CAP, SOFT_CAP, PER_BUYER_CAP,
+            OPENS_AT, CLOSES_AT, &clock, scenario.ctx(),
         );
         sale_id = s_id;
 
@@ -82,7 +72,7 @@ fun strategic_round_soft_cap_miss_refund() {
     };
     scenario.next_tx(ISSUER);
 
-    // --- Tx 3: Verify BUYER_1 for *this sale* ---
+    // Verify BUYER_1 for this specific sale.
     {
         let mut kyc = scenario.take_shared<KycModule>();
         let kyc_cap = scenario.take_from_sender<KycAdminCap>();
@@ -92,7 +82,7 @@ fun strategic_round_soft_cap_miss_refund() {
     };
     scenario.next_tx(BUYER_1);
 
-    // --- Tx 4: BUYER_1 purchases 500 mist ---
+    // BUYER_1 purchases 500 mist. Same PTB: mint entry + purchase.
     {
         let kyc = scenario.take_shared<KycModule>();
         let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
@@ -102,11 +92,7 @@ fun strategic_round_soft_cap_miss_refund() {
         let entry = simple_kyc::mint_entry(&kyc, sale_id, scenario.ctx());
         let payment = coin::mint_for_testing<SUI>(500, scenario.ctx());
         prefunded_sale::purchase<MY_TOKEN, SUI>(
-            &mut sale,
-            payment,
-            option::some(entry),
-            &clock,
-            scenario.ctx(),
+            &mut sale, payment, option::some(entry), &clock, scenario.ctx(),
         );
 
         clock.destroy_for_testing();
@@ -115,7 +101,7 @@ fun strategic_round_soft_cap_miss_refund() {
     };
     scenario.next_tx(ANYONE);
 
-    // --- Tx 5: ANYONE cancels after close (permissionless soft-cap miss) ---
+    // ANYONE cancels after close (permissionless soft-cap miss).
     {
         let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
         let mut vault = scenario.take_shared<RefundVault<SUI>>();
@@ -133,7 +119,7 @@ fun strategic_round_soft_cap_miss_refund() {
     };
     scenario.next_tx(BUYER_1);
 
-    // --- Tx 6: BUYER_1 refunds ---
+    // BUYER_1 refunds.
     {
         let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
         let mut vault = scenario.take_shared<RefundVault<SUI>>();
@@ -150,15 +136,13 @@ fun strategic_round_soft_cap_miss_refund() {
     };
     scenario.next_tx(TREASURY);
 
-    // --- Tx 7: Treasury reclaims unsold inventory ---
+    // Treasury reclaims unsold inventory.
     {
         let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
         let admin_cap = scenario.take_from_sender<SaleAdminCap<MY_TOKEN, SUI>>();
 
         let unsold = prefunded_sale::withdraw_unsold_inventory(
-            &mut sale,
-            &admin_cap,
-            scenario.ctx(),
+            &mut sale, &admin_cap, scenario.ctx(),
         );
         // Buyer's allocation was returned to the pool at refund time.
         assert!(coin::value(&unsold) == INVENTORY, 4);
