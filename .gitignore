@@ -13,3 +13,5 @@ sui.keystore
 # Logs
 *.log
 logs/
+
+*.md
