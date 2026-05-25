@@ -11,17 +11,12 @@
 ///      before reaching the sale.
 ///
 ///   3. `attacker_cannot_claim_buyers_receipt` — misuse rejection.
-///      Even if an attacker gets access to the buyer's receipt object
-///      (here through `take_from_address` shenanigans test_scenario
-///      allows; in real Sui this requires the buyer's signing key),
+///      Even if an attacker gets access to the buyer's receipt object,
 ///      `claim` aborts because `ctx.sender() != receipt.buyer`.
-///
-/// `abort 0` sentinels follow the known-aborting calls in the
-/// `expected_failure` tests so the type checker is satisfied on the
-/// locally bound values.
 #[test_only, allow(lint(abort_without_constant))]
 module sales_example::kyc_gated_tests;
 
+use sales_example::fixed_rate_curve::{Self, FixedRateCurve};
 use sales_example::prefunded_sale::{Self, PrefundedSale};
 use sales_example::refund_vault::RefundVault;
 use sales_example::sale::Receipt;
@@ -83,7 +78,6 @@ fun kyc_gated_purchase_and_claim() {
     };
     scenario.next_tx(ISSUER);
 
-    // Verify the buyer for this specific sale.
     {
         let mut kyc = scenario.take_shared<KycModule>();
         let kyc_cap = scenario.take_from_sender<KycAdminCap>();
@@ -93,17 +87,17 @@ fun kyc_gated_purchase_and_claim() {
     };
     scenario.next_tx(VERIFIED_BUYER);
 
-    // mint_entry + purchase in the same PTB.
     {
         let kyc = scenario.take_shared<KycModule>();
-        let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
+        let mut sale = scenario.take_shared<PrefundedSale<FixedRateCurve, MY_TOKEN, SUI>>();
         let mut clock = clock::create_for_testing(scenario.ctx());
         clock.set_for_testing(2_000);
 
         let entry = simple_kyc::mint_entry(&kyc, sale_id, scenario.ctx());
         let payment = coin::mint_for_testing<SUI>(2_500, scenario.ctx());
-        prefunded_sale::purchase<MY_TOKEN, SUI>(
-            &mut sale, payment, option::some(entry), &clock, scenario.ctx(),
+        let quote = fixed_rate_curve::quote(&sale, 2_500);
+        prefunded_sale::purchase<FixedRateCurve, MY_TOKEN, SUI>(
+            &mut sale, payment, quote, option::some(entry), &clock, scenario.ctx(),
         );
 
         clock.destroy_for_testing();
@@ -112,9 +106,8 @@ fun kyc_gated_purchase_and_claim() {
     };
     scenario.next_tx(ISSUER);
 
-    // Permissionless finalize after close. Vault transitions to Closed.
     {
-        let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
+        let mut sale = scenario.take_shared<PrefundedSale<FixedRateCurve, MY_TOKEN, SUI>>();
         let mut vault = scenario.take_shared<RefundVault<SUI>>();
         let mut clock = clock::create_for_testing(scenario.ctx());
         clock.set_for_testing(11_000);
@@ -128,9 +121,8 @@ fun kyc_gated_purchase_and_claim() {
     };
     scenario.next_tx(VERIFIED_BUYER);
 
-    // Buyer claims.
     {
-        let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
+        let mut sale = scenario.take_shared<PrefundedSale<FixedRateCurve, MY_TOKEN, SUI>>();
         let receipt = scenario.take_from_sender<Receipt<MY_TOKEN>>();
 
         let claimed = prefunded_sale::claim(&mut sale, receipt, scenario.ctx());
@@ -177,7 +169,6 @@ fun unverified_buyer_cannot_mint_entry() {
 
     {
         let kyc = scenario.take_shared<KycModule>();
-        // Aborts: UNVERIFIED_BUYER is not in the verified table.
         let _entry = simple_kyc::mint_entry(&kyc, sale_id, scenario.ctx());
         abort 0
     }
@@ -224,17 +215,17 @@ fun attacker_cannot_claim_buyers_receipt() {
     };
     scenario.next_tx(VERIFIED_BUYER);
 
-    // VERIFIED_BUYER purchases.
     {
         let kyc = scenario.take_shared<KycModule>();
-        let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
+        let mut sale = scenario.take_shared<PrefundedSale<FixedRateCurve, MY_TOKEN, SUI>>();
         let mut clock = clock::create_for_testing(scenario.ctx());
         clock.set_for_testing(2_000);
 
         let entry = simple_kyc::mint_entry(&kyc, sale_id, scenario.ctx());
         let payment = coin::mint_for_testing<SUI>(2_500, scenario.ctx());
-        prefunded_sale::purchase<MY_TOKEN, SUI>(
-            &mut sale, payment, option::some(entry), &clock, scenario.ctx(),
+        let quote = fixed_rate_curve::quote(&sale, 2_500);
+        prefunded_sale::purchase<FixedRateCurve, MY_TOKEN, SUI>(
+            &mut sale, payment, quote, option::some(entry), &clock, scenario.ctx(),
         );
 
         clock.destroy_for_testing();
@@ -244,7 +235,7 @@ fun attacker_cannot_claim_buyers_receipt() {
     scenario.next_tx(ISSUER);
 
     {
-        let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
+        let mut sale = scenario.take_shared<PrefundedSale<FixedRateCurve, MY_TOKEN, SUI>>();
         let mut vault = scenario.take_shared<RefundVault<SUI>>();
         let mut clock = clock::create_for_testing(scenario.ctx());
         clock.set_for_testing(11_000);
@@ -255,10 +246,8 @@ fun attacker_cannot_claim_buyers_receipt() {
     };
     scenario.next_tx(ATTACKER);
 
-    // ATTACKER reaches into VERIFIED_BUYER's inventory and tries to claim.
-    // Aborts: ctx.sender() (ATTACKER) != receipt.buyer (VERIFIED_BUYER).
     {
-        let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
+        let mut sale = scenario.take_shared<PrefundedSale<FixedRateCurve, MY_TOKEN, SUI>>();
         let receipt = scenario.take_from_address<Receipt<MY_TOKEN>>(VERIFIED_BUYER);
         let _claimed = prefunded_sale::claim(&mut sale, receipt, scenario.ctx());
         abort 0

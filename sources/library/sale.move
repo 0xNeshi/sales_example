@@ -1,9 +1,9 @@
 /// Shared types used across the sales library's family of sale flavors.
 ///
-/// Includes the lifecycle enum, the per-buyer claim ticket, and the
-/// optional `VestingSchedule` policy that a sale flavor may attach
-/// to make distribution gradual. The schedule is issuer-defined and
-/// fixed at sale construction — buyers never supply or override it.
+/// Includes the lifecycle enum, the per-buyer claim ticket, the
+/// optional `VestingSchedule` policy a sale flavor may attach, and the
+/// witness-gated `Quote<C>` hot-potato that decouples pricing from the
+/// sale.
 ///
 /// This module owns the lifecycle enum and the per-buyer claim ticket
 /// that every sale flavor reuses. Sale flavors (the v1 `prefunded_sale`,
@@ -40,6 +40,16 @@
 /// trade the resulting `Coin<S>` after `claim` (or `Coin<P>` after
 /// `refund`), or build their own ticket type with abilities and
 /// compliance checks of their choosing.
+///
+/// ### Pricing is witness-gated via `Quote<C>`
+///
+/// The sale flavor stays pricing-agnostic. Each pricing curve ships its
+/// own module that owns a one-time witness type `C: drop` and is the
+/// only place that can mint a `Quote<C>` (via `mint_quote`). The sale's
+/// `purchase` consumes a `Quote<C>` whose phantom `C` matches the sale's
+/// own pricing-curve type parameter. Different curves (fixed rate,
+/// ratcheting rate, future bonding curves) are independent modules with
+/// independent audit stories; the sale never grows new pricing math.
 module sales_example::sale;
 
 use sui::coin::Coin;
@@ -181,6 +191,56 @@ public(package) fun consume_receipt<S>(r: Receipt<S>): (ID, address, u64, u64, u
     object::delete(id);
     (sale_id, buyer, paid, allocation, purchased_at_ms)
 }
+
+// === Quote<C> — witness-gated pricing carrier ===
+//
+// A `Quote<C>` is the only way to drive `purchase` on a
+// `PrefundedSale<C, _, _>`. The hot-potato has no abilities, so:
+//
+// - It can only be produced by `mint_quote`, which requires a value
+//   of type `C: drop`. Since `C`'s constructor is private to the
+//   curve module that declares it, only that module can mint quotes
+//   for `C`-typed sales.
+// - It cannot be stored, copied, or replayed across transactions.
+// - It cannot be transferred to another address.
+// - It cannot be discarded silently. The sale's `purchase` is the
+//   single legal consumer.
+//
+// The carrier pins `sale_id` so a quote minted for sale A cannot be
+// spent on sale B. The sale's `purchase` additionally asserts
+// `quote.paid == coin::value(payment)` to bind the quote to its
+// payment, and asserts `quote.allocation <= quote.paid * sale.max_rate`
+// as a defense-in-depth bound against a buggy / dishonest curve.
+
+/// Hot-potato carrying a curve-priced quote for a single purchase.
+public struct Quote<phantom C> {
+    sale_id: ID,
+    paid: u64,
+    allocation: u64,
+}
+
+/// Witness-gated quote constructor. The curve module declaring `C`
+/// calls this from its `quote(...)` function after running whatever
+/// pricing math it owns. The witness value is taken by value
+/// (`_w: C`) so a malicious caller cannot reuse a single witness
+/// across multiple mint sites without the curve module's cooperation.
+public fun mint_quote<C: drop>(_w: C, sale_id: ID, paid: u64, allocation: u64): Quote<C> {
+    Quote<C> { sale_id, paid, allocation }
+}
+
+/// Destructively read a quote. Library-internal: only sibling library
+/// modules (the sale flavor's `purchase`) unpack quotes. Returns
+/// `(sale_id, paid, allocation)`.
+public(package) fun unpack_quote<C>(q: Quote<C>): (ID, u64, u64) {
+    let Quote { sale_id, paid, allocation } = q;
+    (sale_id, paid, allocation)
+}
+
+public fun quote_sale_id<C>(q: &Quote<C>): ID { q.sale_id }
+
+public fun quote_paid<C>(q: &Quote<C>): u64 { q.paid }
+
+public fun quote_allocation<C>(q: &Quote<C>): u64 { q.allocation }
 
 // === VestingSchedule ===
 //

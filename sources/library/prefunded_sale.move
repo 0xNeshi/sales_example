@@ -1,11 +1,33 @@
-/// `PrefundedSale<S, P>` — fixed-price token sale, v1 flavor.
+/// `PrefundedSale<C, S, P>` — pre-funded token sale, v1 flavor.
 ///
 /// The issuer pre-mints (or pre-acquires) the sale tokens and deposits
 /// them as `Balance<S>` inventory before activation. The sale draws
 /// from that fixed inventory at `claim` time and never holds a
-/// `TreasuryCap<S>`. v2's `MintingSale<S, P>` will be a sibling type
+/// `TreasuryCap<S>`. v2's `MintingSale<C, S, P>` will be a sibling type
 /// that holds a `TreasuryCap<S>` instead — same `Receipt<S>`, same
 /// `Phase`, separate audit boundary.
+///
+/// ### Pricing is curve-agnostic
+///
+/// The sale module owns **no pricing math**. Pricing lives in sibling
+/// curve modules (`fixed_rate_curve`, `ratcheting_rate_curve`, …), each
+/// pinned to its own one-time witness type `C`. The sale carries `C`
+/// as a phantom type parameter; `purchase` consumes a `Quote<C>` hot-
+/// potato that the curve module mints, and the witness gating ensures
+/// only the curve module for this sale's `C` can produce quotes.
+///
+/// The sale stores one pricing-related field: `max_rate`. It is the
+/// curve-supplied supremum on `allocation_per_payment_unit` across the
+/// sale's lifetime. Used for two things:
+///
+/// - **Activation:** `inventory >= hard_cap * max_rate`, so even if the
+///   curve charges the cheapest possible price for the whole sale,
+///   inventory still backs every promised allocation.
+/// - **Per-purchase sanity:** `quote.allocation <= quote.paid *
+///   max_rate`. Defense-in-depth against a buggy or dishonest curve.
+///   A well-behaved curve will never trip this.
+///
+/// `max_rate` is committed at `create_sale` and cannot be raised after.
 ///
 /// ### Lifecycle
 ///
@@ -15,6 +37,8 @@
 ///   set_per_buyer_cap   │  (Init phase — sale is owned by caller;
 ///   pair_refund_vault   ├   holding it by &mut is the authority)
 ///   enable_allowlist    │
+///   set_vesting_schedule│
+///   <curve init>        │  (e.g. fixed_rate_curve::init)
 ///                       │
 ///   share_and_activate ─┴──>  (Active phase — sale is shared)
 ///                                  │
@@ -52,45 +76,12 @@
 ///   wrapped; the sale module itself can never mint or destroy
 ///   receipts outside the `purchase`/`claim`/`refund` paths.
 ///
-/// ### Choosing a sale shape
-///
-/// The sale supports four orthogonal configuration axes. Each is
-/// independent; combine as needed.
-///
-/// - **Hard cap (required).** `hard_cap > 0` is enforced at
-///   `create_sale`. Bounds the maximum raise. `inventory >=
-///   hard_cap * rate` is enforced at activation, so sold-out and
-///   hard-cap-reached coincide.
-/// - **Soft cap (optional, `0 = none`).** Minimum raise required for
-///   `finalize`. If the window closes with `raised < soft_cap`,
-///   `cancel_after_close` is callable by anyone; refunds become
-///   available to all buyers.
-/// - **Per-buyer cap (optional).** Cumulative cap on a single buyer's
-///   payment to this sale. Enforced inside `purchase` against the
-///   running `contributions[buyer]` total. Configure with
-///   `set_per_buyer_cap`.
-/// - **Allowlist (optional).** Switches the sale into compliance-gated
-///   mode: every `purchase` must consume an `AllowEntry<S>` minted by
-///   the consumer's compliance module. Configure with
-///   `enable_allowlist`.
-///
-/// The three common shapes a fixed-price sale takes:
-///
-/// | Shape | KYC | Soft cap | Per-buyer cap | Typical use |
-/// |---|---|---|---|---|
-/// | Public round | no | no | no | Open public sale, FCFS |
-/// | Capped public round | no | optional | yes | Anti-whale public sale |
-/// | Strategic round | yes | yes | yes | Compliance-gated raise |
-///
-/// **What this primitive is not:** not a bonding curve, not an LBP,
-/// not a Dutch / English / sealed-bid auction, not a fair launch.
-/// Those have different mechanics (price discovery, auction clearing)
-/// and belong in separate standards.
-///
 /// ### Integrator footguns
 ///
 /// 1. **All setup must happen before `share_and_activate`.** Setup
 ///    functions assert `phase == Init`; after activation they abort.
+///    This includes initialising the pricing curve (the curve module's
+///    own `init_curve(...)` runs in Init).
 ///
 /// 2. **`SaleAdminCap<S, P>` controls only the admin-only paths.**
 ///    Wrap it in an RBAC / multisig / governance object. Losing the
@@ -131,7 +122,7 @@ module sales_example::prefunded_sale;
 
 use sales_example::allowlist::{Self, AllowEntry, AllowlistAdmin};
 use sales_example::refund_vault::{Self, RefundVault, RefundVaultCap};
-use sales_example::sale::{Self, Phase, Receipt, VestingSchedule, VestedAllocation};
+use sales_example::sale::{Self, Phase, Receipt, Quote, VestingSchedule, VestedAllocation};
 
 use sui::balance::{Self, Balance};
 use sui::clock::{Self, Clock};
@@ -173,7 +164,7 @@ const EActivationAfterClose: vector<u8> = "Cannot activate: closes_at_ms is alre
 
 // Pricing & accounting
 #[error(code = 30)]
-const ERateZero: vector<u8> = "rate must be greater than zero";
+const EMaxRateZero: vector<u8> = "max_rate must be greater than zero";
 #[error(code = 31)]
 const EHardCapZero: vector<u8> = "hard_cap must be greater than zero";
 #[error(code = 32)]
@@ -181,7 +172,7 @@ const EInvalidCapsOrdering: vector<u8> = "soft_cap must be <= hard_cap";
 #[error(code = 33)]
 const EZeroPayment: vector<u8> = "Payment must be greater than zero";
 #[error(code = 34)]
-const EAllocationOverflow: vector<u8> = "payment * rate overflows u64";
+const EAllocationOverMaxRate: vector<u8> = "Quote allocation exceeds paid * max_rate";
 #[error(code = 35)]
 const ERaisedOverflow: vector<u8> = "raised + payment overflows u64";
 #[error(code = 36)]
@@ -189,9 +180,9 @@ const EContributionOverflow: vector<u8> = "buyer contribution + payment overflow
 #[error(code = 37)]
 const EHardCapExceeded: vector<u8> = "Purchase would exceed hard_cap";
 #[error(code = 38)]
-const EInventoryOverflowAtActivate: vector<u8> = "hard_cap * rate overflows u64; cannot guarantee inventory backing";
+const EInventoryOverflowAtActivate: vector<u8> = "hard_cap * max_rate overflows u64; cannot guarantee inventory backing";
 #[error(code = 39)]
-const EInsufficientInventoryAtActivate: vector<u8> = "Inventory at activation does not cover hard_cap * rate";
+const EInsufficientInventoryAtActivate: vector<u8> = "Inventory at activation does not cover hard_cap * max_rate";
 
 // Caps
 #[error(code = 40)]
@@ -243,9 +234,15 @@ const EClaimRequiresVesting: vector<u8> = "Sale has a vesting schedule; redeem v
 #[error(code = 92)]
 const ENoVestingScheduleAttached: vector<u8> = "Sale has no vesting schedule; use claim instead of claim_into_vesting";
 
+// Quote / curve coupling
+#[error(code = 100)]
+const EQuoteSaleMismatch: vector<u8> = "Quote does not belong to this sale";
+#[error(code = 101)]
+const EQuotePaymentMismatch: vector<u8> = "Quote.paid does not match the payment coin value";
+
 // === Types ===
 
-public struct PrefundedSale<phantom S, phantom P> has key {
+public struct PrefundedSale<phantom C, phantom S, phantom P> has key {
     id: UID,
 
     // Inventory & accounting
@@ -261,8 +258,11 @@ public struct PrefundedSale<phantom S, phantom P> has key {
     proceeds: Balance<P>,
 
     // Pricing
-    /// Sale tokens (smallest units) per 1 payment-coin smallest unit.
-    rate: u64,
+    /// Curve-supplied supremum on `allocation_per_payment_unit` over
+    /// the sale's lifetime. Used for inventory backing at activation
+    /// (`inventory >= hard_cap * max_rate`) and as a per-purchase
+    /// sanity bound (`quote.allocation <= quote.paid * max_rate`).
+    max_rate: u64,
 
     // Caps
     hard_cap: u64,    // > 0; enforced at create_sale
@@ -303,49 +303,49 @@ public struct SaleAdminCap<phantom S, phantom P> has key, store {
 
 // === Events ===
 
-public struct SaleCreated<phantom S, phantom P> has copy, drop {
+public struct SaleCreated<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
-    rate: u64,
+    max_rate: u64,
     hard_cap: u64,
     soft_cap: u64,
     opens_at_ms: u64,
     closes_at_ms: u64,
 }
 
-public struct InventoryDeposited<phantom S, phantom P> has copy, drop {
+public struct InventoryDeposited<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     amount: u64,
     inventory_after: u64,
 }
 
-public struct PerBuyerCapSet<phantom S, phantom P> has copy, drop {
+public struct PerBuyerCapSet<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     cap: u64,
 }
 
-public struct VestingScheduleSet<phantom S, phantom P> has copy, drop {
+public struct VestingScheduleSet<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     start_ms: u64,
     cliff_duration_ms: u64,
     duration_ms: u64,
 }
 
-public struct RefundVaultPaired<phantom S, phantom P> has copy, drop {
+public struct RefundVaultPaired<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     vault_id: ID,
 }
 
-public struct AllowlistEnabled<phantom S, phantom P> has copy, drop {
+public struct AllowlistEnabled<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     allowlist_admin_id: ID,
 }
 
-public struct SaleActivated<phantom S, phantom P> has copy, drop {
+public struct SaleActivated<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     activated_at_ms: u64,
 }
 
-public struct Purchased<phantom S, phantom P> has copy, drop {
+public struct Purchased<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     buyer: address,
     receipt_id: ID,
@@ -355,7 +355,7 @@ public struct Purchased<phantom S, phantom P> has copy, drop {
     purchased_at_ms: u64,
 }
 
-public struct SaleFinalized<phantom S, phantom P> has copy, drop {
+public struct SaleFinalized<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     raised: u64,
     closed_at_ms: u64,
@@ -366,33 +366,33 @@ public enum CancelReason has copy, drop, store {
     AdminEmergency,
 }
 
-public struct SaleCancelled<phantom S, phantom P> has copy, drop {
+public struct SaleCancelled<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     raised: u64,
     reason: CancelReason,
     closed_at_ms: u64,
 }
 
-public struct Claimed<phantom S, phantom P> has copy, drop {
+public struct Claimed<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     buyer: address,
     receipt_id: ID,
     amount: u64,
 }
 
-public struct Refunded<phantom S, phantom P> has copy, drop {
+public struct Refunded<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     buyer: address,
     receipt_id: ID,
     amount: u64,
 }
 
-public struct ProceedsWithdrawn<phantom S, phantom P> has copy, drop {
+public struct ProceedsWithdrawn<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     amount: u64,
 }
 
-public struct InventoryWithdrawn<phantom S, phantom P> has copy, drop {
+public struct InventoryWithdrawn<phantom C, phantom S, phantom P> has copy, drop {
     sale_id: ID,
     amount: u64,
 }
@@ -401,7 +401,7 @@ public struct InventoryWithdrawn<phantom S, phantom P> has copy, drop {
 
 const U64_MAX: u128 = 18446744073709551615;
 
-fun assert_admin<S, P>(sale: &PrefundedSale<S, P>, cap: &SaleAdminCap<S, P>) {
+fun assert_admin<C, S, P>(sale: &PrefundedSale<C, S, P>, cap: &SaleAdminCap<S, P>) {
     assert!(cap.sale_id == object::id(sale), EWrongAdminCap);
 }
 
@@ -416,30 +416,37 @@ fun assert_sender_is_buyer<S>(receipt: &Receipt<S>, ctx: &TxContext) {
 /// calls in the same PTB and then calls `share_and_activate` to
 /// transition to `Active`.
 ///
+/// `max_rate` is the curve-supplied upper bound on
+/// `allocation_per_payment_unit` across the whole sale lifetime. A
+/// fixed-rate curve sets `max_rate = rate`. A ratcheting-down curve
+/// sets `max_rate = initial_rate` (the maximum). The library uses it
+/// only as a defensive cap on the curve's output — the curve module
+/// is responsible for committing to it at its own setup step.
+///
 /// Asserts:
-/// - `rate > 0`
+/// - `max_rate > 0`
 /// - `hard_cap > 0` (every sale must have a bounded raise)
 /// - `soft_cap <= hard_cap`
 /// - `opens_at_ms < closes_at_ms`
-public fun create_sale<S, P>(
-    rate: u64,
+public fun create_sale<C, S, P>(
+    max_rate: u64,
     hard_cap: u64,
     soft_cap: u64,
     opens_at_ms: u64,
     closes_at_ms: u64,
     ctx: &mut TxContext,
-): (PrefundedSale<S, P>, SaleAdminCap<S, P>) {
-    assert!(rate > 0, ERateZero);
+): (PrefundedSale<C, S, P>, SaleAdminCap<S, P>) {
+    assert!(max_rate > 0, EMaxRateZero);
     assert!(hard_cap > 0, EHardCapZero);
     assert!(soft_cap <= hard_cap, EInvalidCapsOrdering);
     assert!(opens_at_ms < closes_at_ms, EInvalidTimeRange);
 
-    let sale = PrefundedSale<S, P> {
+    let sale = PrefundedSale<C, S, P> {
         id: object::new(ctx),
         inventory: balance::zero<S>(),
         total_allocated: 0,
         proceeds: balance::zero<P>(),
-        rate,
+        max_rate,
         hard_cap,
         soft_cap,
         raised: 0,
@@ -456,9 +463,9 @@ public fun create_sale<S, P>(
     let sale_id = object::id(&sale);
     let cap = SaleAdminCap<S, P> { id: object::new(ctx), sale_id };
 
-    event::emit(SaleCreated<S, P> {
+    event::emit(SaleCreated<C, S, P> {
         sale_id,
-        rate,
+        max_rate,
         hard_cap,
         soft_cap,
         opens_at_ms,
@@ -471,11 +478,11 @@ public fun create_sale<S, P>(
 /// Deposit sale tokens into inventory. May be called multiple times
 /// during Init. Authority is implicit: the sale is owned, so only the
 /// caller that created it can pass it as `&mut`.
-public fun deposit_inventory<S, P>(sale: &mut PrefundedSale<S, P>, inventory: Coin<S>) {
+public fun deposit_inventory<C, S, P>(sale: &mut PrefundedSale<C, S, P>, inventory: Coin<S>) {
     assert!(sale::is_init(&sale.phase), ENotInit);
     let amount = coin::value(&inventory);
     balance::join(&mut sale.inventory, coin::into_balance(inventory));
-    event::emit(InventoryDeposited<S, P> {
+    event::emit(InventoryDeposited<C, S, P> {
         sale_id: object::id(sale),
         amount,
         inventory_after: balance::value(&sale.inventory),
@@ -492,8 +499,8 @@ public fun deposit_inventory<S, P>(sale: &mut PrefundedSale<S, P>, inventory: Co
 /// Asserts:
 /// - `per_buyer_cap > 0` (a zero cap would block every purchase).
 /// - Not already configured (`set_per_buyer_cap` is one-shot).
-public fun set_per_buyer_cap<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun set_per_buyer_cap<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     per_buyer_cap: u64,
     ctx: &mut TxContext,
 ) {
@@ -502,7 +509,7 @@ public fun set_per_buyer_cap<S, P>(
     assert!(per_buyer_cap > 0, EPerBuyerCapZero);
     option::fill(&mut sale.per_buyer_cap, per_buyer_cap);
     option::fill(&mut sale.contributions, table::new<address, u64>(ctx));
-    event::emit(PerBuyerCapSet<S, P> {
+    event::emit(PerBuyerCapSet<C, S, P> {
         sale_id: object::id(sale),
         cap: per_buyer_cap,
     });
@@ -519,8 +526,8 @@ public fun set_per_buyer_cap<S, P>(
 /// buyer cannot trivially bypass the schedule. The schedule is
 /// **issuer-defined**: the buyer is the caller of the redemption
 /// path and cannot supply or override these values.
-public fun set_vesting_schedule<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun set_vesting_schedule<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     start_ms: u64,
     cliff_duration_ms: u64,
     duration_ms: u64,
@@ -529,7 +536,7 @@ public fun set_vesting_schedule<S, P>(
     assert!(option::is_none(&sale.vesting_schedule), EVestingScheduleAlreadySet);
     let schedule = sale::new_vesting_schedule(start_ms, cliff_duration_ms, duration_ms);
     option::fill(&mut sale.vesting_schedule, schedule);
-    event::emit(VestingScheduleSet<S, P> {
+    event::emit(VestingScheduleSet<C, S, P> {
         sale_id: object::id(sale),
         start_ms,
         cliff_duration_ms,
@@ -551,8 +558,8 @@ public fun set_vesting_schedule<S, P>(
 ///   `withdraw_all` requires `Closed` (reachable only via the sale's
 ///   `finalize`, which does not return the cap).
 /// - No prior vault has been paired.
-public fun pair_refund_vault<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun pair_refund_vault<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     vault: &RefundVault<P>,
     vault_cap: RefundVaultCap<P>,
 ) {
@@ -565,7 +572,7 @@ public fun pair_refund_vault<S, P>(
     let vault_id = object::id(vault);
     option::fill(&mut sale.refund_vault_id, vault_id);
     option::fill(&mut sale.refund_vault_cap, vault_cap);
-    event::emit(RefundVaultPaired<S, P> {
+    event::emit(RefundVaultPaired<C, S, P> {
         sale_id: object::id(sale),
         vault_id,
     });
@@ -578,8 +585,8 @@ public fun pair_refund_vault<S, P>(
 /// One-shot: aborts if called twice on the same sale. Duplicate
 /// admins would let two compliance modules mint entries
 /// independently for the same sale, defeating the gating.
-public fun enable_allowlist<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun enable_allowlist<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     ctx: &mut TxContext,
 ): AllowlistAdmin<S> {
     assert!(sale::is_init(&sale.phase), ENotInit);
@@ -587,7 +594,7 @@ public fun enable_allowlist<S, P>(
     sale.requires_allowlist = true;
     let sale_id = object::id(sale);
     let admin = allowlist::new_admin<S>(sale_id, ctx);
-    event::emit(AllowlistEnabled<S, P> {
+    event::emit(AllowlistEnabled<C, S, P> {
         sale_id,
         allowlist_admin_id: object::id(&admin),
     });
@@ -598,18 +605,18 @@ public fun enable_allowlist<S, P>(
 ///
 /// Asserts:
 /// - A refund vault has been paired (every sale requires one).
-/// - `inventory >= hard_cap * rate` (u128-checked for overflow).
+/// - `inventory >= hard_cap * max_rate` (u128-checked for overflow).
 ///   Sold-out and hard-cap-reached therefore coincide; `purchase`
 ///   never aborts with "out of inventory" before "exceeds cap".
 /// - `now < closes_at_ms`. Activating after the window has elapsed
 ///   would share a stale sale that immediately becomes finalizable
 ///   or cancellable with no purchase opportunity. Activation before
 ///   `opens_at_ms` is allowed.
-public fun share_and_activate<S, P>(mut sale: PrefundedSale<S, P>, clock: &Clock) {
+public fun share_and_activate<C, S, P>(mut sale: PrefundedSale<C, S, P>, clock: &Clock) {
     assert!(sale::is_init(&sale.phase), ENotInit);
     assert!(option::is_some(&sale.refund_vault_cap), EVaultRequiredForActivate);
 
-    let required_128 = (sale.hard_cap as u128) * (sale.rate as u128);
+    let required_128 = (sale.hard_cap as u128) * (sale.max_rate as u128);
     assert!(required_128 <= U64_MAX, EInventoryOverflowAtActivate);
     let required = required_128 as u64;
     assert!(balance::value(&sale.inventory) >= required, EInsufficientInventoryAtActivate);
@@ -620,7 +627,7 @@ public fun share_and_activate<S, P>(mut sale: PrefundedSale<S, P>, clock: &Clock
     sale.phase = sale::phase_active();
     let sale_id = object::id(&sale);
     transfer::share_object(sale);
-    event::emit(SaleActivated<S, P> { sale_id, activated_at_ms });
+    event::emit(SaleActivated<C, S, P> { sale_id, activated_at_ms });
 }
 
 // === Active phase ===
@@ -628,16 +635,27 @@ public fun share_and_activate<S, P>(mut sale: PrefundedSale<S, P>, clock: &Clock
 /// Buy sale tokens. Delivers a fresh `Receipt<S>` to `ctx.sender()`
 /// (the buyer). Payment is added to `sale.proceeds`.
 ///
+/// The pricing is supplied by the curve module that owns witness `C`
+/// via a `Quote<C>` hot-potato. Only that curve module can mint such
+/// a quote. The sale verifies:
+/// - `quote.sale_id == object::id(sale)` — quote was minted for this
+///   sale (prevents cross-sale replay).
+/// - `quote.paid == coin::value(payment)` — quote is bound to its
+///   payment coin.
+/// - `quote.allocation <= quote.paid * max_rate` — defense-in-depth
+///   bound against a buggy / dishonest curve.
+///
 /// `allow` must be `Some` iff `requires_allowlist == true`. The
 /// entry is consumed; its `sale_id` and `buyer` are asserted.
 ///
 /// All arithmetic on user-controlled inputs (`raised + paid`,
-/// `contribution + paid`, `paid * rate`) is widened to `u128` and
+/// `contribution + paid`, `paid * max_rate`) is widened to `u128` and
 /// bounds-checked before downcasting, so oversized payments abort
 /// with a typed error rather than the default arithmetic overflow.
-public fun purchase<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun purchase<C: drop, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     payment: Coin<P>,
+    quote: Quote<C>,
     allow: Option<AllowEntry<S>>,
     clock: &Clock,
     ctx: &mut TxContext,
@@ -659,9 +677,18 @@ public fun purchase<S, P>(
         0
     };
 
-    // Hard cap (u128-widened)
-    let paid = coin::value(&payment);
+    // Unpack quote and bind it to this sale + payment.
+    let (quote_sale_id, paid, allocation) = sale::unpack_quote(quote);
+    assert!(quote_sale_id == object::id(sale), EQuoteSaleMismatch);
+    assert!(paid == coin::value(&payment), EQuotePaymentMismatch);
     assert!(paid > 0, EZeroPayment);
+
+    // Allocation must not exceed the curve-supplied supremum.
+    let max_alloc_128 = (paid as u128) * (sale.max_rate as u128);
+    assert!(max_alloc_128 <= U64_MAX, EAllocationOverMaxRate);
+    assert!((allocation as u128) <= max_alloc_128, EAllocationOverMaxRate);
+
+    // Hard cap (u128-widened)
     let new_raised_128 = (sale.raised as u128) + (paid as u128);
     assert!(new_raised_128 <= U64_MAX, ERaisedOverflow);
     assert!(new_raised_128 <= (sale.hard_cap as u128), EHardCapExceeded);
@@ -690,10 +717,7 @@ public fun purchase<S, P>(
         };
     };
 
-    // Allocation + inventory backing (u128-checked)
-    let allocation_128 = (paid as u128) * (sale.rate as u128);
-    assert!(allocation_128 <= U64_MAX, EAllocationOverflow);
-    let allocation = allocation_128 as u64;
+    // Inventory backing.
     let unallocated = balance::value(&sale.inventory) - sale.total_allocated;
     assert!(allocation <= unallocated, EInsufficientInventoryAtActivate);
 
@@ -708,7 +732,7 @@ public fun purchase<S, P>(
     let receipt_id = object::id(&receipt);
     sale::deliver_receipt(receipt, buyer);
 
-    event::emit(Purchased<S, P> {
+    event::emit(Purchased<C, S, P> {
         sale_id,
         buyer,
         receipt_id,
@@ -727,8 +751,8 @@ public fun purchase<S, P>(
 /// Allowed when phase is `Active` and either:
 /// - `now > closes_at_ms` and `raised >= soft_cap`, or
 /// - `raised >= hard_cap` (sold-out — closes early).
-public fun finalize<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun finalize<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     vault: &mut RefundVault<P>,
     clock: &Clock,
 ) {
@@ -749,7 +773,7 @@ public fun finalize<S, P>(
     };
 
     sale.phase = sale::phase_finalized();
-    event::emit(SaleFinalized<S, P> {
+    event::emit(SaleFinalized<C, S, P> {
         sale_id: object::id(sale),
         raised: sale.raised,
         closed_at_ms: now,
@@ -762,8 +786,8 @@ public fun finalize<S, P>(
 /// `soft_cap > 0`, and `raised < soft_cap`. Drains `sale.proceeds`
 /// into the paired vault and flips vault to `Refunding`. Buyers then
 /// call `refund` individually.
-public fun cancel_after_close<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun cancel_after_close<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     vault: &mut RefundVault<P>,
     clock: &Clock,
     ctx: &mut TxContext,
@@ -792,8 +816,8 @@ public fun cancel_after_close<S, P>(
 ///
 /// Drains `sale.proceeds` into the vault and flips vault to
 /// `Refunding`.
-public fun cancel_emergency<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun cancel_emergency<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     cap: &SaleAdminCap<S, P>,
     vault: &mut RefundVault<P>,
     clock: &Clock,
@@ -811,8 +835,8 @@ public fun cancel_emergency<S, P>(
 }
 
 /// Shared body of `cancel_after_close` and `cancel_emergency`.
-fun do_cancel<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+fun do_cancel<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     vault: &mut RefundVault<P>,
     reason: CancelReason,
     now: u64,
@@ -830,7 +854,7 @@ fun do_cancel<S, P>(
 
     sale.phase = sale::phase_cancelled();
 
-    event::emit(SaleCancelled<S, P> {
+    event::emit(SaleCancelled<C, S, P> {
         sale_id: object::id(sale),
         raised: sale.raised,
         reason,
@@ -848,8 +872,8 @@ fun do_cancel<S, P>(
 /// `claim_into_vesting`. This is the library's enforcement that the
 /// schedule cannot be bypassed by calling the immediate-distribution
 /// path.
-public fun claim<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun claim<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     receipt: Receipt<S>,
     ctx: &mut TxContext,
 ): Coin<S> {
@@ -864,7 +888,7 @@ public fun claim<S, P>(
     sale.total_allocated = sale.total_allocated - allocation;
     let payout = balance::split(&mut sale.inventory, allocation);
 
-    event::emit(Claimed<S, P> {
+    event::emit(Claimed<C, S, P> {
         sale_id: object::id(sale),
         buyer,
         receipt_id,
@@ -878,8 +902,8 @@ public fun claim<S, P>(
 /// `ctx.sender() == receipt.buyer` on each. Aborts the whole call
 /// if any receipt is invalid. Inherits the no-vesting guard from
 /// `claim`.
-public fun claim_all<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun claim_all<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     mut receipts: vector<Receipt<S>>,
     ctx: &mut TxContext,
 ): Coin<S> {
@@ -901,12 +925,13 @@ public fun claim_all<S, P>(
 /// ability and its fields are private to `sale.move`, so the caller
 /// cannot stash it, discard it, or extract the raw `Coin<S>`. The
 /// only consumer paths live in `vested_claim`, which route the coin
-/// into a `VestingWallet<S>` matching the sale's schedule.
+/// into a `VestingWallet<LinearCurve, S>` matching the sale's
+/// schedule.
 ///
 /// Asserts `ctx.sender() == receipt.buyer` (same buyer-binding rule
 /// as `claim`). Destroys the receipt.
-public fun claim_into_vesting<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun claim_into_vesting<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     receipt: Receipt<S>,
     ctx: &mut TxContext,
 ): VestedAllocation<S> {
@@ -925,7 +950,7 @@ public fun claim_into_vesting<S, P>(
     let schedule = *option::borrow(&sale.vesting_schedule);
     let sale_id = object::id(sale);
 
-    event::emit(Claimed<S, P> {
+    event::emit(Claimed<C, S, P> {
         sale_id,
         buyer,
         receipt_id,
@@ -936,8 +961,8 @@ public fun claim_into_vesting<S, P>(
 }
 
 /// Withdraw collected proceeds. Phase must be `Finalized`.
-public fun withdraw_proceeds<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun withdraw_proceeds<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     cap: &SaleAdminCap<S, P>,
     ctx: &mut TxContext,
 ): Coin<P> {
@@ -945,7 +970,7 @@ public fun withdraw_proceeds<S, P>(
     assert!(sale::is_finalized(&sale.phase), ENotFinalized);
     let amount = balance::value(&sale.proceeds);
     let part = balance::split(&mut sale.proceeds, amount);
-    event::emit(ProceedsWithdrawn<S, P> {
+    event::emit(ProceedsWithdrawn<C, S, P> {
         sale_id: object::id(sale),
         amount,
     });
@@ -956,8 +981,8 @@ public fun withdraw_proceeds<S, P>(
 /// `Cancelled`. Strictly the unreserved portion
 /// (`inventory - total_allocated`); outstanding receipts remain
 /// backed.
-public fun withdraw_unsold_inventory<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun withdraw_unsold_inventory<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     cap: &SaleAdminCap<S, P>,
     ctx: &mut TxContext,
 ): Coin<S> {
@@ -968,7 +993,7 @@ public fun withdraw_unsold_inventory<S, P>(
     );
     let unallocated = balance::value(&sale.inventory) - sale.total_allocated;
     let part = balance::split(&mut sale.inventory, unallocated);
-    event::emit(InventoryWithdrawn<S, P> {
+    event::emit(InventoryWithdrawn<C, S, P> {
         sale_id: object::id(sale),
         amount: unallocated,
     });
@@ -980,8 +1005,8 @@ public fun withdraw_unsold_inventory<S, P>(
 /// Refund a buyer's payment. Asserts
 /// `ctx.sender() == receipt.buyer`. Destroys the receipt and pays
 /// `receipt.paid` worth of `Coin<P>` out of the paired vault.
-public fun refund<S, P>(
-    sale: &mut PrefundedSale<S, P>,
+public fun refund<C, S, P>(
+    sale: &mut PrefundedSale<C, S, P>,
     vault: &mut RefundVault<P>,
     receipt: Receipt<S>,
     ctx: &mut TxContext,
@@ -1002,7 +1027,7 @@ public fun refund<S, P>(
         refund_vault::release_balance(vault, cap_ref, paid)
     };
 
-    event::emit(Refunded<S, P> {
+    event::emit(Refunded<C, S, P> {
         sale_id: object::id(sale),
         buyer,
         receipt_id,
@@ -1012,56 +1037,74 @@ public fun refund<S, P>(
     coin::from_balance(payment, ctx)
 }
 
+// === Curve-config storage hooks ===
+//
+// Curve modules in this library stash their per-sale config on the
+// sale itself via dynamic fields. The sale's UID is exposed through
+// `public(package)` accessors so only sibling library modules (the
+// curve modules) can attach / read the data. Third parties that ship
+// their own curves in a different package cannot reach the UID.
+
+/// Library-internal `&UID` accessor for curve modules to read their
+/// dynamic-field state on the sale.
+public(package) fun uid<C, S, P>(sale: &PrefundedSale<C, S, P>): &UID { &sale.id }
+
+/// Library-internal `&mut UID` accessor for curve modules to write
+/// their dynamic-field state on the sale during Init.
+public(package) fun uid_mut<C, S, P>(sale: &mut PrefundedSale<C, S, P>): &mut UID { &mut sale.id }
+
 // === Views ===
 
-public fun phase<S, P>(sale: &PrefundedSale<S, P>): Phase { sale.phase }
+public fun phase<C, S, P>(sale: &PrefundedSale<C, S, P>): Phase { sale.phase }
 
-public fun raised<S, P>(sale: &PrefundedSale<S, P>): u64 { sale.raised }
+public fun raised<C, S, P>(sale: &PrefundedSale<C, S, P>): u64 { sale.raised }
 
-public fun rate<S, P>(sale: &PrefundedSale<S, P>): u64 { sale.rate }
+/// Curve-supplied supremum on `allocation_per_payment_unit`. Used
+/// internally for inventory backing and per-purchase sanity bounds.
+public fun max_rate<C, S, P>(sale: &PrefundedSale<C, S, P>): u64 { sale.max_rate }
 
-public fun hard_cap<S, P>(sale: &PrefundedSale<S, P>): u64 { sale.hard_cap }
+public fun hard_cap<C, S, P>(sale: &PrefundedSale<C, S, P>): u64 { sale.hard_cap }
 
-public fun soft_cap<S, P>(sale: &PrefundedSale<S, P>): u64 { sale.soft_cap }
+public fun soft_cap<C, S, P>(sale: &PrefundedSale<C, S, P>): u64 { sale.soft_cap }
 
-public fun opens_at_ms<S, P>(sale: &PrefundedSale<S, P>): u64 { sale.opens_at_ms }
+public fun opens_at_ms<C, S, P>(sale: &PrefundedSale<C, S, P>): u64 { sale.opens_at_ms }
 
-public fun closes_at_ms<S, P>(sale: &PrefundedSale<S, P>): u64 { sale.closes_at_ms }
+public fun closes_at_ms<C, S, P>(sale: &PrefundedSale<C, S, P>): u64 { sale.closes_at_ms }
 
-public fun requires_allowlist<S, P>(sale: &PrefundedSale<S, P>): bool { sale.requires_allowlist }
+public fun requires_allowlist<C, S, P>(sale: &PrefundedSale<C, S, P>): bool { sale.requires_allowlist }
 
 /// Read the sale's vesting schedule. Returns `Some(schedule)` if the
 /// issuer called `set_vesting_schedule` during Init, otherwise `None`.
 /// Vesting adapters read this to determine the redemption shape.
-public fun vesting_schedule<S, P>(sale: &PrefundedSale<S, P>): Option<VestingSchedule> {
+public fun vesting_schedule<C, S, P>(sale: &PrefundedSale<C, S, P>): Option<VestingSchedule> {
     sale.vesting_schedule
 }
 
-public fun inventory_total<S, P>(sale: &PrefundedSale<S, P>): u64 {
+public fun inventory_total<C, S, P>(sale: &PrefundedSale<C, S, P>): u64 {
     balance::value(&sale.inventory)
 }
 
-public fun total_allocated<S, P>(sale: &PrefundedSale<S, P>): u64 { sale.total_allocated }
+public fun total_allocated<C, S, P>(sale: &PrefundedSale<C, S, P>): u64 { sale.total_allocated }
 
-public fun inventory_remaining<S, P>(sale: &PrefundedSale<S, P>): u64 {
+public fun inventory_remaining<C, S, P>(sale: &PrefundedSale<C, S, P>): u64 {
     balance::value(&sale.inventory) - sale.total_allocated
 }
 
-public fun proceeds_amount<S, P>(sale: &PrefundedSale<S, P>): u64 {
+public fun proceeds_amount<C, S, P>(sale: &PrefundedSale<C, S, P>): u64 {
     balance::value(&sale.proceeds)
 }
 
-public fun is_open<S, P>(sale: &PrefundedSale<S, P>, clock: &Clock): bool {
+public fun is_open<C, S, P>(sale: &PrefundedSale<C, S, P>, clock: &Clock): bool {
     if (!sale::is_active(&sale.phase)) { return false };
     let now = clock::timestamp_ms(clock);
     now >= sale.opens_at_ms && now <= sale.closes_at_ms
 }
 
-public fun has_reached_soft_cap<S, P>(sale: &PrefundedSale<S, P>): bool {
+public fun has_reached_soft_cap<C, S, P>(sale: &PrefundedSale<C, S, P>): bool {
     sale.raised >= sale.soft_cap
 }
 
-public fun has_reached_hard_cap<S, P>(sale: &PrefundedSale<S, P>): bool {
+public fun has_reached_hard_cap<C, S, P>(sale: &PrefundedSale<C, S, P>): bool {
     sale.raised >= sale.hard_cap
 }
 

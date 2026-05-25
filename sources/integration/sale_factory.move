@@ -1,10 +1,14 @@
-/// Domain-named deploy helpers for the four common fixed-price sale
-/// shapes. Integrator-owned, not part of the audited library.
+/// Domain-named deploy helpers for the common sale shapes.
+/// Integrator-owned, not part of the audited library.
 ///
 /// The helpers consume the library's public API only. They exist so
 /// the issuer's tooling has plain-English entry points
 /// (`deploy_strategic_round`, etc.) instead of asking every caller
 /// to compose the raw primitives.
+///
+/// Every helper below uses the **fixed-rate** pricing curve
+/// (`FixedRateCurve`). For ratcheting (price-increases-over-time)
+/// sales, use the primitives + `ratcheting_rate_curve` directly.
 ///
 /// ### Which helper to use
 ///
@@ -39,19 +43,9 @@
 /// aborts and buyers must redeem through
 /// `claim_into_vesting → vested_claim::into_*`. See the strategic
 /// round documentation below for details.
-///
-/// ### What this library does not do
-///
-/// All helpers produce **fixed-price** sales. None of them
-/// implements:
-/// - bonding-curve / LBP price discovery,
-/// - Dutch / English / sealed-bid auctions,
-/// - fair-launch token-mint patterns (no pre-mine, public-from-t=0
-///   bonding curve, etc).
-///
-/// Reach for a different primitive if those are what you need.
 module sales_example::sale_factory;
 
+use sales_example::fixed_rate_curve::{Self, FixedRateCurve};
 use sales_example::prefunded_sale;
 use sales_example::refund_vault;
 use sales_example::my_token::{Self as my_token, MY_TOKEN};
@@ -100,10 +94,14 @@ public fun deploy_strategic_round(
     clock: &Clock,
     ctx: &mut TxContext,
 ): (ID, ID) {
-    let (mut sale, sale_admin_cap) = prefunded_sale::create_sale<MY_TOKEN, SUI>(
-        rate, hard_cap, soft_cap, opens_at_ms, closes_at_ms, ctx,
+    let (mut sale, sale_admin_cap) = prefunded_sale::create_sale<FixedRateCurve, MY_TOKEN, SUI>(
+        /* max_rate */ rate, hard_cap, soft_cap, opens_at_ms, closes_at_ms, ctx,
     );
     let sale_id = prefunded_sale::cap_sale_id(&sale_admin_cap);
+
+    // Attach the fixed-rate pricing curve at the rate the caller
+    // committed to. `max_rate == rate` so inventory backing is tight.
+    fixed_rate_curve::init_curve(&mut sale, rate);
 
     // Mint inventory and deposit.
     let inventory = my_token::mint(treasury_cap, inventory_amount, ctx);
@@ -168,10 +166,12 @@ public fun deploy_strategic_round_vested(
     clock: &Clock,
     ctx: &mut TxContext,
 ): (ID, ID) {
-    let (mut sale, sale_admin_cap) = prefunded_sale::create_sale<MY_TOKEN, SUI>(
-        rate, hard_cap, soft_cap, opens_at_ms, closes_at_ms, ctx,
+    let (mut sale, sale_admin_cap) = prefunded_sale::create_sale<FixedRateCurve, MY_TOKEN, SUI>(
+        /* max_rate */ rate, hard_cap, soft_cap, opens_at_ms, closes_at_ms, ctx,
     );
     let sale_id = prefunded_sale::cap_sale_id(&sale_admin_cap);
+
+    fixed_rate_curve::init_curve(&mut sale, rate);
 
     let inventory = my_token::mint(treasury_cap, inventory_amount, ctx);
     prefunded_sale::deposit_inventory(&mut sale, inventory);
@@ -223,8 +223,8 @@ public fun deploy_public_round(
     clock: &Clock,
     ctx: &mut TxContext,
 ): (ID, ID) {
-    let (mut sale, sale_admin_cap) = prefunded_sale::create_sale<MY_TOKEN, SUI>(
-        rate,
+    let (mut sale, sale_admin_cap) = prefunded_sale::create_sale<FixedRateCurve, MY_TOKEN, SUI>(
+        /* max_rate */ rate,
         hard_cap,
         /* soft_cap */ 0,
         opens_at_ms,
@@ -232,6 +232,8 @@ public fun deploy_public_round(
         ctx,
     );
     let sale_id = prefunded_sale::cap_sale_id(&sale_admin_cap);
+
+    fixed_rate_curve::init_curve(&mut sale, rate);
 
     let inventory = my_token::mint(treasury_cap, inventory_amount, ctx);
     prefunded_sale::deposit_inventory(&mut sale, inventory);
@@ -269,8 +271,8 @@ public fun deploy_capped_public_round(
     clock: &Clock,
     ctx: &mut TxContext,
 ): (ID, ID) {
-    let (mut sale, sale_admin_cap) = prefunded_sale::create_sale<MY_TOKEN, SUI>(
-        rate,
+    let (mut sale, sale_admin_cap) = prefunded_sale::create_sale<FixedRateCurve, MY_TOKEN, SUI>(
+        /* max_rate */ rate,
         hard_cap,
         /* soft_cap */ 0,
         opens_at_ms,
@@ -278,6 +280,8 @@ public fun deploy_capped_public_round(
         ctx,
     );
     let sale_id = prefunded_sale::cap_sale_id(&sale_admin_cap);
+
+    fixed_rate_curve::init_curve(&mut sale, rate);
 
     let inventory = my_token::mint(treasury_cap, inventory_amount, ctx);
     prefunded_sale::deposit_inventory(&mut sale, inventory);

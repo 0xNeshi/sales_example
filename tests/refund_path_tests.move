@@ -1,19 +1,8 @@
 /// Scenario walkthrough: soft-cap miss with refund vault.
-///
-/// The flow exercised:
-///   - Issuer publishes MY_TOKEN and the KYC module.
-///   - Issuer deploys a strategic round (KYC + soft cap + vault +
-///     per-buyer cap).
-///   - Issuer verifies BUYER_1 for this specific sale at a per-entry cap.
-///   - BUYER_1 purchases a small amount (well under soft cap).
-///   - The window closes without reaching soft cap; a non-admin third
-///     party calls the permissionless `cancel_after_close`. Proceeds
-///     drain into the vault, vault flips to `Refunding`.
-///   - BUYER_1 refunds, getting back exactly what they paid.
-///   - Treasury reclaims unsold inventory.
 #[test_only]
 module sales_example::refund_path_tests;
 
+use sales_example::fixed_rate_curve::{Self, FixedRateCurve};
 use sales_example::prefunded_sale::{Self, PrefundedSale, SaleAdminCap};
 use sales_example::refund_vault::{Self, RefundVault};
 use sales_example::sale::Receipt;
@@ -72,7 +61,6 @@ fun strategic_round_soft_cap_miss_refund() {
     };
     scenario.next_tx(ISSUER);
 
-    // Verify BUYER_1 for this specific sale.
     {
         let mut kyc = scenario.take_shared<KycModule>();
         let kyc_cap = scenario.take_from_sender<KycAdminCap>();
@@ -82,17 +70,17 @@ fun strategic_round_soft_cap_miss_refund() {
     };
     scenario.next_tx(BUYER_1);
 
-    // BUYER_1 purchases 500 mist. Same PTB: mint entry + purchase.
     {
         let kyc = scenario.take_shared<KycModule>();
-        let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
+        let mut sale = scenario.take_shared<PrefundedSale<FixedRateCurve, MY_TOKEN, SUI>>();
         let mut clock = clock::create_for_testing(scenario.ctx());
         clock.set_for_testing(2_000);
 
         let entry = simple_kyc::mint_entry(&kyc, sale_id, scenario.ctx());
         let payment = coin::mint_for_testing<SUI>(500, scenario.ctx());
-        prefunded_sale::purchase<MY_TOKEN, SUI>(
-            &mut sale, payment, option::some(entry), &clock, scenario.ctx(),
+        let quote = fixed_rate_curve::quote(&sale, 500);
+        prefunded_sale::purchase<FixedRateCurve, MY_TOKEN, SUI>(
+            &mut sale, payment, quote, option::some(entry), &clock, scenario.ctx(),
         );
 
         clock.destroy_for_testing();
@@ -101,9 +89,8 @@ fun strategic_round_soft_cap_miss_refund() {
     };
     scenario.next_tx(ANYONE);
 
-    // ANYONE cancels after close (permissionless soft-cap miss).
     {
-        let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
+        let mut sale = scenario.take_shared<PrefundedSale<FixedRateCurve, MY_TOKEN, SUI>>();
         let mut vault = scenario.take_shared<RefundVault<SUI>>();
         let mut clock = clock::create_for_testing(scenario.ctx());
         clock.set_for_testing(11_000);
@@ -119,9 +106,8 @@ fun strategic_round_soft_cap_miss_refund() {
     };
     scenario.next_tx(BUYER_1);
 
-    // BUYER_1 refunds.
     {
-        let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
+        let mut sale = scenario.take_shared<PrefundedSale<FixedRateCurve, MY_TOKEN, SUI>>();
         let mut vault = scenario.take_shared<RefundVault<SUI>>();
         let receipt = scenario.take_from_sender<Receipt<MY_TOKEN>>();
 
@@ -136,15 +122,13 @@ fun strategic_round_soft_cap_miss_refund() {
     };
     scenario.next_tx(TREASURY);
 
-    // Treasury reclaims unsold inventory.
     {
-        let mut sale = scenario.take_shared<PrefundedSale<MY_TOKEN, SUI>>();
+        let mut sale = scenario.take_shared<PrefundedSale<FixedRateCurve, MY_TOKEN, SUI>>();
         let admin_cap = scenario.take_from_sender<SaleAdminCap<MY_TOKEN, SUI>>();
 
         let unsold = prefunded_sale::withdraw_unsold_inventory(
             &mut sale, &admin_cap, scenario.ctx(),
         );
-        // Buyer's allocation was returned to the pool at refund time.
         assert!(coin::value(&unsold) == INVENTORY, 4);
 
         transfer::public_transfer(unsold, TREASURY);
